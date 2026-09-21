@@ -2,8 +2,6 @@ import path from 'node:path';
 import { AttachmentBuilder, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
 import { download, removeDir } from '../download/downloader.js';
 import { uploadLimitBytes } from '../download/platforms.js';
-import { successEmbed } from '../music/controls.js';
-import { escapeMarkdown, truncate } from '../utils/format.js';
 import { UserError } from '../utils/voice.js';
 
 const MAX_FILES_PER_MESSAGE = 10;
@@ -41,13 +39,10 @@ export default {
     const limitBytes = uploadLimitBytes(interaction.guild);
     const result = await download(link, { userId: interaction.user.id, limitBytes });
     try {
-      const title = result.title ? escapeMarkdown(truncate(result.title.replace(/\s+/g, ' '), 200)) : null;
-      let description = `📥 **${result.platform}** download${title ? `\n${title}` : ''}`;
-      if (result.skipped > 0) description += `\n⚠️ ${result.skipped} item(s) were skipped because they are too large or unavailable.`;
-
+      const content = result.skipped > 0 ? `-# ⚠️ ${result.skipped} item(s) were skipped because they are too large or unavailable.` : '';
       const batches = batchFiles(result.files, limitBytes);
       const toAttachments = (batch) => batch.map((f) => new AttachmentBuilder(f.path, { name: path.basename(f.path) }));
-      await interaction.editReply({ embeds: [successEmbed(description)], files: toAttachments(batches[0]) });
+      await interaction.editReply({ content, files: toAttachments(batches[0]) });
       for (const batch of batches.slice(1)) {
         await interaction.followUp({ files: toAttachments(batch) });
       }

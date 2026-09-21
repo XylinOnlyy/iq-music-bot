@@ -146,8 +146,8 @@ async function listFiles(dir) {
   return files;
 }
 
-async function downloadWithYtDlp(url, dir, limitBytes) {
-  const info = await runJson(['--no-playlist', '--playlist-items', `1-${MAX_ITEMS}`, '--', url], { timeoutMs: 60_000 });
+async function downloadWithYtDlp(url, dir, limitBytes, prefetchedInfo = null) {
+  const info = prefetchedInfo ?? await runJson(['--no-playlist', '--playlist-items', `1-${MAX_ITEMS}`, '--', url], { timeoutMs: 60_000 });
   if (info.is_live || info.live_status === 'is_live') throw new DownloadError('Live streams cannot be downloaded.');
   if (info.duration && info.duration > MAX_DURATION_SECONDS) throw new DownloadError('That video is too long to download.');
 
@@ -244,12 +244,14 @@ async function instagramImages(url) {
   return urls.size ? { urls: [...urls], title: caption || null } : null;
 }
 
+const hasVideo = (entry) => (entry?.formats ?? []).some((f) => f.vcodec && f.vcodec !== 'none');
+
 async function downloadInstagram(url, dir, limitBytes) {
+  let info;
   try {
-    return await downloadWithYtDlp(url.href, dir, limitBytes);
+    // Without --ignore-no-formats-error yt-dlp rejects photo posts; with it, photos come back as thumbnails.
+    info = await runJson(['--ignore-no-formats-error', '--yes-playlist', '--playlist-items', `1-${MAX_ITEMS}`, '--', url.href], { timeoutMs: 60_000 });
   } catch (err) {
-    if (err instanceof DownloadError && !/Nothing was downloaded/.test(err.message)) throw err;
-    // yt-dlp only handles videos; photo posts fall through to the embed page.
     const images = await instagramImages(url).catch(() => null);
     if (images) {
       const { files, tooLarge } = await downloadImages(images.urls, dir, limitBytes, { Referer: 'https://www.instagram.com/' });
@@ -260,6 +262,58 @@ async function downloadInstagram(url, dir, limitBytes) {
     }
     throw new DownloadError(`Couldn't download that Instagram post: ${err.message}`);
   }
+
+  const isPlaylist = info._type === 'playlist';
+  if (!isPlaylist && hasVideo(info)) return downloadWithYtDlp(url.href, dir, limitBytes, info);
+
+  const entries = isPlaylist ? (info.entries ?? []).filter(Boolean).slice(0, MAX_ITEMS) : [info];
+  const videoIndexes = [];
+  let skipped = 0;
+  for (const [i, entry] of entries.entries()) {
+    const index = entry.playlist_index ?? i + 1;
+    if (hasVideo(entry)) {
+      videoIndexes.push(index);
+      continue;
+    }
+    const imageUrl = entry.thumbnail ?? entry.thumbnails?.at(-1)?.url;
+    if (!imageUrl) {
+      skipped++;
+      continue;
+    }
+    const tmp = path.join(dir, `${String(index).padStart(3, '0')}_image`);
+    try {
+      const file = await downloadFile(imageUrl, tmp, limitBytes, entry.http_headers ?? {});
+      await fsp.rename(tmp, `${tmp}.${extFromContentType(file.contentType, 'jpg')}`);
+    } catch (err) {
+      logger.debug('Instagram image download failed:', err.message);
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+      skipped++;
+    }
+  }
+
+  if (videoIndexes.length) {
+    await runRaw([
+      ...baseArgs(),
+      '--yes-playlist',
+      '--ignore-no-formats-error',
+      '--playlist-items', videoIndexes.join(','),
+      '--merge-output-format', 'mp4',
+      '--no-mtime',
+      '-f', 'b[ext=mp4]/bv*+ba/b',
+      '-S', 'vcodec:h264,ext:mp4:m4a',
+      '-o', path.join(dir, '%(playlist_index)03d_video.%(ext)s'),
+      '--',
+      url.href,
+    ], { timeoutMs: 10 * 60_000 }).catch((err) => logger.warn('Instagram video download failed:', err.message));
+  }
+
+  const all = await listFiles(dir);
+  const videos = all.filter((f) => f.path.includes('_video.')).length;
+  skipped += Math.max(0, videoIndexes.length - videos);
+  const fitting = all.filter((f) => f.size <= limitBytes);
+  skipped += all.length - fitting.length;
+  if (!fitting.length) throw new DownloadError("Couldn't download anything from that Instagram post.");
+  return { title: info.description ?? info.title ?? null, files: fitting, skipped };
 }
 
 async function downloadTikTok(url, dir, limitBytes) {
